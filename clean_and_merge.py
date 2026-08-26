@@ -4,7 +4,7 @@ into a single master CSV, WITHOUT fabricating any price data.
 
 Design principle: never invent OHLC values. Where data looks suspicious
 (flat candle, missing candle, weekend gap), we FLAG it with a boolean
-column instead of overwriting/interpolating. Your backtest/swing-detection
+column instead of overwriting/interpolating. The backtest/swing-detection
 code decides what to do with flagged rows (e.g. skip them).
 
 Usage:
@@ -16,9 +16,9 @@ import pandas as pd
 import glob
 import os
 
-RAW_DIR = "raw_data"
-OUT_FILE = "xauusd_m5_master.csv"
-TIMEFRAME_SECONDS = 5 * 60  # 5-minute candles
+RAW_DIR = "data/raw/m5"      
+OUT_FILE = "data/processed/xauusd_m5_master.csv"   
+TIMEFRAME_SECONDS = 5 * 60    # change to 60 when cleaning the 1-min set
 WEEKEND_GAP_THRESHOLD_HOURS = 20  # anything bigger than this = weekend gap
 SHORT_GAP_THRESHOLD_MINUTES = 15  # anything bigger than one missed candle = flagged gap
 

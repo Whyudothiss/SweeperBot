@@ -16,7 +16,7 @@ const path = require("path");
 const START_YEAR = 2015;
 const END_YEAR = 2025; // inclusive
 const INSTRUMENT = "xauusd";
-const TIMEFRAME = "m5";
+const TIMEFRAME = "m1";
 const OUT_DIR = path.join(__dirname, "raw_data", TIMEFRAME);
 
 if (!fs.existsSync(OUT_DIR)) {

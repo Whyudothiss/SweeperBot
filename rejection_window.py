@@ -10,8 +10,8 @@ Usage:
 import pandas as pd
 from strategy_engine import StrategyConfig, run_backtest
 
-SIGNAL_PATH = "xauusd_m5_master.parquet"
-EXEC_PATH = "xauusd_m1_master.parquet"
+SIGNAL_PATH = "data/processed/xauusd_m5_master.parquet"
+EXEC_PATH = "data/processed/xauusd_m1_master.parquet"
 
 # candidate values to test: 0 = strict same-candle only
 CANDIDATE_VALUES = [0, 1, 2, 3, 5, 10, 20, 50]

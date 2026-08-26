@@ -33,11 +33,13 @@ from typing import Optional, List
 
 @dataclass
 class StrategyConfig:
-    lookback: int = 2              # candles to the left required to confirm a swing
-    lookforward: int = 1           # candles to the right required to confirm a swing
+    lookback: int = 5              # candles to the left required to confirm a swing
+    lookforward: int = 10           # candles to the right required to confirm a swing
     atr_period: int = 14
     stop_buffer_atr_mult: float = 0.15   # buffer beyond sweep wick, in units of ATR
     trail_activation_r: float = 1.0      # start trailing once unrealized profit >= this many R
+    max_pending_bars: int = 100          # invalidate a pending sweep if BOS doesn't confirm within this many signal-timeframe bars
+    max_rejection_wait_bars: int = 20    # invalidate a wick-through-level watch if it never closes back inside within this many bars
     base_capital: float = 10_000.0
     risk_pct: float = 0.005              # 0.5% of current equity per trade
     direction: str = "both"              # "long", "short", or "both"
@@ -66,11 +68,25 @@ class Trade:
 def compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
-    tr = pd.concat([
+    tr_with_gap = pd.concat([
         high - low,
         (high - prev_close).abs(),
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
+
+    # For candles immediately after a weekend/data gap, the prev_close jump
+    # is not real intra-session volatility -- fall back to just high-low so
+    # a weekend gap doesn't inflate the ATR-based stop buffer.
+    if "is_weekend_gap" in df.columns or "is_short_data_gap" in df.columns:
+        gap_mask = pd.Series(False, index=df.index)
+        if "is_weekend_gap" in df.columns:
+            gap_mask = gap_mask | df["is_weekend_gap"].fillna(False)
+        if "is_short_data_gap" in df.columns:
+            gap_mask = gap_mask | df["is_short_data_gap"].fillna(False)
+        tr = tr_with_gap.where(~gap_mask, high - low)
+    else:
+        tr = tr_with_gap
+
     return tr.rolling(period).mean()
 
 
@@ -91,6 +107,10 @@ def detect_swings(df: pd.DataFrame, lookback: int, lookforward: int) -> pd.DataF
     highs = df["high"].values
     lows = df["low"].values
     usable = ~df["is_suspect"].values if "is_suspect" in df.columns else np.ones(n, dtype=bool)
+    if "is_weekend_gap" in df.columns:
+        usable = usable & ~df["is_weekend_gap"].fillna(False).values
+    if "is_short_data_gap" in df.columns:
+        usable = usable & ~df["is_short_data_gap"].fillna(False).values
 
     is_swing_high = np.zeros(n, dtype=bool)
     is_swing_low = np.zeros(n, dtype=bool)
@@ -127,34 +147,52 @@ def detect_swings(df: pd.DataFrame, lookback: int, lookforward: int) -> pd.DataF
 
 def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
     """
-    Walks forward bar by bar (index order = time order). At each bar:
-      - only swings confirmed as of THIS bar (swing_confirmed_idx <= current i)
-        are eligible to be referenced.
-      - tracks the most recent unswept confirmed swing high / low.
-      - detects a sweep: current bar's high/low exceeds the tracked level,
-        and the SAME or a LATER bar closes back inside it (rejection).
-      - after a sweep, watches for a break of structure through the most
-        recent confirmed swing on the OPPOSITE side -> that's the entry.
+    Walks forward bar by bar (index order = time order). Tracks three states:
+
+      1. No active setup: watching the most recent confirmed swing high/low
+         for a wick beyond the level.
+      2. Watching for rejection: a wick has broken the level, but the close
+         hasn't come back inside yet -- this can span multiple bars. The
+         tracked "extreme" keeps updating to the furthest wick reached while
+         watching, in case price pushes further before rejecting. If the
+         close never comes back inside within max_rejection_wait_bars, the
+         watch is cancelled (treated as a genuine breakout, not a sweep).
+      3. Confirmed sweep, watching for BOS: once the close comes back inside
+         the level, we watch for a break of structure through the most
+         recent confirmed swing on the OPPOSITE side. If that doesn't
+         happen within max_pending_bars, the setup is cancelled.
+
+    Entry is filled at the OPEN of the candle immediately after the BOS
+    confirmation candle (not the BOS candle's own close), since in live
+    trading you can't transact at a price the instant it prints -- the
+    earliest realistic fill is the next candle's open.
+
     Returns a list of signal dicts: {time, direction, entry_price, sweep_extreme}
     """
     n = len(df)
     highs = df["high"].values
     lows = df["low"].values
     closes = df["close"].values
+    opens = df["open"].values
     times = df["datetime_utc"].values
 
     # pools of confirmed-and-not-yet-swept swing levels, most recent first
     recent_swing_high = None  # (price, index)
     recent_swing_low = None
 
-    pending_sweep = None  # dict describing an in-progress sweep waiting for BOS
+    pending_watch = None   # {"direction", "level", "extreme", "start_idx"} -- wick broke level, awaiting rejection close
+    pending_sweep = None   # {"direction", "extreme", "swept_idx"} -- rejection confirmed, awaiting BOS
 
     signals = []
 
     for i in range(n):
-        # activate any swing confirmed as of this bar
-        if df["is_swing_high_raw"].iat[i - cfg.lookforward] if i - cfg.lookforward >= 0 else False:
-            pass  # handled via confirmed_idx pass below
+        # invalidate a pending sweep if BOS hasn't confirmed within the timeout window
+        if pending_sweep is not None and (i - pending_sweep["swept_idx"]) > cfg.max_pending_bars:
+            pending_sweep = None
+
+        # invalidate a rejection watch if price never closed back inside the level
+        if pending_watch is not None and (i - pending_watch["start_idx"]) > cfg.max_rejection_wait_bars:
+            pending_watch = None
 
         # bring in newly confirmed swings (confirmed_idx == i means usable from here)
         confirmed_now = df.index[df["swing_confirmed_idx"] == i]
@@ -164,29 +202,42 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
             if df["is_swing_low_raw"].iat[ci]:
                 recent_swing_low = (lows[ci], ci)
 
-        # --- check for sweep of the recent swing high (-> potential short) ---
-        if recent_swing_high is not None and pending_sweep is None:
+        # --- start watching for a wick through the recent swing high (-> potential short) ---
+        if pending_watch is None and pending_sweep is None and recent_swing_high is not None:
             level, _ = recent_swing_high
-            if highs[i] > level and closes[i] < level:
-                # swept and rejected back below in the same bar
-                pending_sweep = {"direction": "short", "extreme": highs[i], "swept_idx": i}
+            if highs[i] > level:
+                pending_watch = {"direction": "short", "level": level, "extreme": highs[i], "start_idx": i}
 
-        if recent_swing_low is not None and pending_sweep is None:
+        if pending_watch is None and pending_sweep is None and recent_swing_low is not None:
             level, _ = recent_swing_low
-            if lows[i] < level and closes[i] > level:
-                pending_sweep = {"direction": "long", "extreme": lows[i], "swept_idx": i}
+            if lows[i] < level:
+                pending_watch = {"direction": "long", "level": level, "extreme": lows[i], "start_idx": i}
 
-        # --- if we have a pending sweep, watch for BOS confirmation ---
+        # --- while watching, update the extreme and check for the rejection close ---
+        if pending_watch is not None:
+            if pending_watch["direction"] == "short":
+                pending_watch["extreme"] = max(pending_watch["extreme"], highs[i])
+                if closes[i] < pending_watch["level"]:
+                    pending_sweep = {"direction": "short", "extreme": pending_watch["extreme"], "swept_idx": i}
+                    pending_watch = None
+            else:
+                pending_watch["extreme"] = min(pending_watch["extreme"], lows[i])
+                if closes[i] > pending_watch["level"]:
+                    pending_sweep = {"direction": "long", "extreme": pending_watch["extreme"], "swept_idx": i}
+                    pending_watch = None
+
+        # --- if we have a confirmed sweep, watch for BOS confirmation ---
         if pending_sweep is not None and i > pending_sweep["swept_idx"]:
             if pending_sweep["direction"] == "short" and recent_swing_low is not None:
                 bos_level, _ = recent_swing_low
-                if closes[i] < bos_level:
+                if closes[i] < bos_level and i + 1 < n:
                     if cfg.direction in ("both", "short"):
                         signals.append({
-                            "time": times[i],
-                            "index": i,
+                            "time": times[i + 1],
+                            "index": i,          # BOS confirmation index (used to look up ATR etc.)
+                            "fill_index": i + 1, # candle whose open we actually fill at
                             "direction": "short",
-                            "entry_price": closes[i],
+                            "entry_price": opens[i + 1],
                             "sweep_extreme": pending_sweep["extreme"],
                         })
                     pending_sweep = None
@@ -194,13 +245,14 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
 
             elif pending_sweep["direction"] == "long" and recent_swing_high is not None:
                 bos_level, _ = recent_swing_high
-                if closes[i] > bos_level:
+                if closes[i] > bos_level and i + 1 < n:
                     if cfg.direction in ("both", "long"):
                         signals.append({
-                            "time": times[i],
+                            "time": times[i + 1],
                             "index": i,
+                            "fill_index": i + 1,
                             "direction": "long",
-                            "entry_price": closes[i],
+                            "entry_price": opens[i + 1],
                             "sweep_extreme": pending_sweep["extreme"],
                         })
                     pending_sweep = None

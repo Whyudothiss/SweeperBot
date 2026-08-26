@@ -1,0 +1,13 @@
+node_modules/
+.dukascopy-cache/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local environment files
+.env
+
+# OS/editor noise
+.DS_Store
+.vscode/

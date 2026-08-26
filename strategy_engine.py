@@ -59,6 +59,9 @@ class Trade:
     exit_reason: Optional[str] = None
     r_multiple: Optional[float] = None
     pnl_dollars: Optional[float] = None
+    # Number of 1-minute OHLC bars where the high/low ordering could change
+    # the trailing-stop result.  The simulator takes the conservative exit.
+    ambiguous_intrabar_events: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +188,14 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
 
     signals = []
 
+    # A direct lookup avoids scanning the entire DataFrame on every bar.
+    # `swing_confirmed_idx` is calculated from the positional index above, so
+    # this preserves the same no-look-ahead timing as the prior implementation.
+    confirmed_by_idx = {}
+    for candidate_idx, confirmed_idx in enumerate(df["swing_confirmed_idx"].values):
+        if confirmed_idx >= 0:
+            confirmed_by_idx.setdefault(int(confirmed_idx), []).append(candidate_idx)
+
     for i in range(n):
         # invalidate a pending sweep if BOS hasn't confirmed within the timeout window
         if pending_sweep is not None and (i - pending_sweep["swept_idx"]) > cfg.max_pending_bars:
@@ -195,8 +206,7 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
             pending_watch = None
 
         # bring in newly confirmed swings (confirmed_idx == i means usable from here)
-        confirmed_now = df.index[df["swing_confirmed_idx"] == i]
-        for ci in confirmed_now:
+        for ci in confirmed_by_idx.get(i, []):
             if df["is_swing_high_raw"].iat[ci]:
                 recent_swing_high = (highs[ci], ci)
             if df["is_swing_low_raw"].iat[ci]:
@@ -285,9 +295,18 @@ def simulate_trade(
     else:
         initial_stop = sweep_extreme + buffer
 
-    stop_distance = abs(entry_price - initial_stop)
-    if stop_distance <= 0 or np.isnan(stop_distance):
-        return None  # degenerate, skip
+    # A stop must be on the loss side of the entry.  Using abs() here used to
+    # turn a nonsensical stop on the profitable side into an instant +1R win.
+    if not np.isfinite(entry_price) or not np.isfinite(initial_stop):
+        return None
+    if direction == "long":
+        if initial_stop >= entry_price:
+            return None
+        stop_distance = entry_price - initial_stop
+    else:
+        if initial_stop <= entry_price:
+            return None
+        stop_distance = initial_stop - entry_price
 
     risk_dollars = equity * cfg.risk_pct
     size = risk_dollars / stop_distance
@@ -302,64 +321,91 @@ def simulate_trade(
         risk_dollars=risk_dollars,
     )
 
-    # walk forward on 1-min bars from entry_time onward
-    exec_slice = exec_df[exec_df["datetime_utc"] >= entry_time]
-    if exec_slice.empty:
+    # Find the first eligible 1-min bar without copying/scanning every later
+    # bar for every trade.  The execution data is expected to be time-sorted.
+    exec_start_idx = exec_df["datetime_utc"].searchsorted(entry_time, side="left")
+    if exec_start_idx >= len(exec_df):
         return None
 
     current_stop = initial_stop
     trailing_active = False
     r_one_distance = stop_distance  # 1R = initial risk distance
 
-    exec_highs = exec_slice["high"].values
-    exec_lows = exec_slice["low"].values
-    exec_times = exec_slice["datetime_utc"].values
+    exec_highs = exec_df["high"].values
+    exec_lows = exec_df["low"].values
+    exec_closes = exec_df["close"].values
+    exec_times = exec_df["datetime_utc"].values
 
-    for j in range(len(exec_slice)):
+    for j in range(exec_start_idx, len(exec_df)):
         bar_high = exec_highs[j]
         bar_low = exec_lows[j]
         bar_time = exec_times[j]
 
         if direction == "long":
-            # stop check first (touch-based, worst-case-first ordering within bar)
+            # Existing stop first: if it was touched at any point in the bar,
+            # use that older, less favorable stop.
+            will_trail = trailing_active or (
+                (bar_high - entry_price) / r_one_distance >= cfg.trail_activation_r
+            )
+            candidate_stop = current_stop
+            if will_trail:
+                candidate_stop = max(current_stop, bar_high - r_one_distance)
+            stop_was_raised = candidate_stop > current_stop
+            ambiguous = stop_was_raised and bar_low <= candidate_stop
+
             if bar_low <= current_stop:
+                if ambiguous:
+                    trade.ambiguous_intrabar_events += 1
                 trade.exit_time = pd.Timestamp(bar_time)
                 trade.exit_price = current_stop
                 trade.exit_reason = "trail_stop" if trailing_active else "initial_stop"
                 break
 
-            # activate trailing once 1R reached
-            unrealized_r = (bar_high - entry_price) / r_one_distance
-            if not trailing_active and unrealized_r >= cfg.trail_activation_r:
-                trailing_active = True
+            trailing_active = will_trail
+            current_stop = candidate_stop
 
-            if trailing_active:
-                # simple structure-free trail: lock in stop at
-                # (current best favorable price - r_one_distance), never moving down
-                candidate_stop = bar_high - r_one_distance
-                if candidate_stop > current_stop:
-                    current_stop = candidate_stop
+            # If the low could have occurred after the high that raised the
+            # stop, OHLC data cannot establish the order.  Conservatively
+            # assume it did and exit at the newly raised stop.
+            if ambiguous:
+                trade.ambiguous_intrabar_events += 1
+                trade.exit_time = pd.Timestamp(bar_time)
+                trade.exit_price = current_stop
+                trade.exit_reason = "trail_stop"
+                break
 
         else:  # short
+            will_trail = trailing_active or (
+                (entry_price - bar_low) / r_one_distance >= cfg.trail_activation_r
+            )
+            candidate_stop = current_stop
+            if will_trail:
+                candidate_stop = min(current_stop, bar_low + r_one_distance)
+            stop_was_lowered = candidate_stop < current_stop
+            ambiguous = stop_was_lowered and bar_high >= candidate_stop
+
             if bar_high >= current_stop:
+                if ambiguous:
+                    trade.ambiguous_intrabar_events += 1
                 trade.exit_time = pd.Timestamp(bar_time)
                 trade.exit_price = current_stop
                 trade.exit_reason = "trail_stop" if trailing_active else "initial_stop"
                 break
 
-            unrealized_r = (entry_price - bar_low) / r_one_distance
-            if not trailing_active and unrealized_r >= cfg.trail_activation_r:
-                trailing_active = True
+            trailing_active = will_trail
+            current_stop = candidate_stop
 
-            if trailing_active:
-                candidate_stop = bar_low + r_one_distance
-                if candidate_stop < current_stop:
-                    current_stop = candidate_stop
+            if ambiguous:
+                trade.ambiguous_intrabar_events += 1
+                trade.exit_time = pd.Timestamp(bar_time)
+                trade.exit_price = current_stop
+                trade.exit_reason = "trail_stop"
+                break
 
     else:
         # ran off the end of available data without being stopped out
         trade.exit_time = pd.Timestamp(exec_times[-1])
-        trade.exit_price = exec_slice["close"].iat[-1]
+        trade.exit_price = exec_closes[-1]
         trade.exit_reason = "data_end"
 
     if direction == "long":
@@ -413,8 +459,10 @@ def summarize(trades: List[Trade], base_capital: float, final_equity: float):
     wins = [t for t in trades if t.pnl_dollars > 0]
     total_return_pct = (final_equity - base_capital) / base_capital * 100
     avg_r = np.mean([t.r_multiple for t in trades])
+    ambiguous_events = sum(t.ambiguous_intrabar_events for t in trades)
     print(f"Trades: {n}")
     print(f"Win rate: {len(wins)/n*100:.1f}%")
     print(f"Avg R multiple: {avg_r:.2f}")
+    print(f"Ambiguous 1-min trailing-stop events: {ambiguous_events}")
     print(f"Final equity: {final_equity:.2f}  (from {base_capital:.2f})")
     print(f"Total return: {total_return_pct:.2f}%")

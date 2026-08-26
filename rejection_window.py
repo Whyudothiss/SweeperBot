@@ -14,7 +14,7 @@ SIGNAL_PATH = "data/processed/xauusd_m5_master.parquet"
 EXEC_PATH = "data/processed/xauusd_m1_master.parquet"
 
 # candidate values to test: 0 = strict same-candle only
-CANDIDATE_VALUES = [0, 1, 2, 3, 5, 10, 20, 50]
+CANDIDATE_VALUES = [0]
 
 # hold these fixed while sweeping the rejection window
 FIXED_LOOKBACK = 2
@@ -44,12 +44,14 @@ def main():
                 "max_rejection_wait_bars": wait_bars,
                 "trades": 0, "win_rate_pct": None,
                 "avg_r": None, "total_return_pct": None,
+                "ambiguous_intrabar_events": 0,
             })
             print("  No trades generated.")
             continue
 
         wins = sum(1 for t in trades if t.pnl_dollars > 0)
         avg_r = sum(t.r_multiple for t in trades) / n
+        ambiguous_events = sum(t.ambiguous_intrabar_events for t in trades)
         total_return_pct = (final_equity - cfg.base_capital) / cfg.base_capital * 100
 
         results.append({
@@ -58,9 +60,11 @@ def main():
             "win_rate_pct": round(wins / n * 100, 1),
             "avg_r": round(avg_r, 2),
             "total_return_pct": round(total_return_pct, 2),
+            "ambiguous_intrabar_events": ambiguous_events,
         })
         print(f"  Trades: {n}, Win rate: {wins/n*100:.1f}%, Avg R: {avg_r:.2f}, "
-              f"Return: {total_return_pct:.2f}%")
+              f"Return: {total_return_pct:.2f}%, "
+              f"Ambiguous 1-min events: {ambiguous_events}")
 
     results_df = pd.DataFrame(results)
     results_df.to_csv("rejection_window_sweep_results.csv", index=False)

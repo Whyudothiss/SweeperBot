@@ -11,3 +11,6 @@ __pycache__/
 # OS/editor noise
 .DS_Store
 .vscode/
+
+# Generated processed market data
+data/processed/*.csv

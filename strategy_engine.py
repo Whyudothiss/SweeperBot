@@ -33,13 +33,13 @@ from typing import Optional, List
 
 @dataclass
 class StrategyConfig:
-    lookback: int = 5              # candles to the left required to confirm a swing
-    lookforward: int = 10           # candles to the right required to confirm a swing
+    lookback: int = 2              # candles to the left required to confirm a swing
+    lookforward: int = 1           # candles to the right required to confirm a swing
     atr_period: int = 14
     stop_buffer_atr_mult: float = 0.15   # buffer beyond sweep wick, in units of ATR
     trail_activation_r: float = 1.0      # start trailing once unrealized profit >= this many R
     max_pending_bars: int = 100          # invalidate a pending sweep if BOS doesn't confirm within this many signal-timeframe bars
-    max_rejection_wait_bars: int = 20    # invalidate a wick-through-level watch if it never closes back inside within this many bars
+    max_rejection_wait_bars: int = 0    # invalidate a wick-through-level watch if it never closes back inside within this many bars
     base_capital: float = 10_000.0
     risk_pct: float = 0.005              # 0.5% of current equity per trade
     direction: str = "both"              # "long", "short", or "both"

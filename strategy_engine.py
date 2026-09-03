@@ -27,6 +27,14 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 
 
+def _as_utc_timestamp(value) -> pd.Timestamp:
+    """Normalize numpy/pandas timestamps to timezone-aware UTC."""
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("UTC")
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -54,6 +62,11 @@ class Trade:
     sweep_extreme: float
     size: float
     risk_dollars: float
+    bos_index: Optional[int] = None
+    fill_index: Optional[int] = None
+    swept_level: Optional[float] = None
+    swept_swing_index: Optional[int] = None
+    sweep_extreme_index: Optional[int] = None
     exit_time: Optional[pd.Timestamp] = None
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
@@ -183,8 +196,8 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
     recent_swing_high = None  # (price, index)
     recent_swing_low = None
 
-    pending_watch = None   # {"direction", "level", "extreme", "start_idx"} -- wick broke level, awaiting rejection close
-    pending_sweep = None   # {"direction", "extreme", "swept_idx"} -- rejection confirmed, awaiting BOS
+    pending_watch = None   # {"direction", "level", "swing_idx", "extreme", "extreme_idx", "start_idx"} -- wick broke level, awaiting rejection close
+    pending_sweep = None   # {"direction", "level", "swing_idx", "extreme", "sweep_extreme_idx", "swept_idx"} -- rejection confirmed, awaiting BOS
 
     signals = []
 
@@ -205,6 +218,19 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
         if pending_watch is not None and (i - pending_watch["start_idx"]) > cfg.max_rejection_wait_bars:
             pending_watch = None
 
+        # A later break beyond the rejection wick means the earlier sweep did
+        # not hold.  It is no longer a valid reversal setup, so do not let it
+        # wait for a BOS that happens much later.
+        if pending_sweep is not None and i > pending_sweep["swept_idx"]:
+            if (
+                pending_sweep["direction"] == "short"
+                and highs[i] > pending_sweep["extreme"]
+            ) or (
+                pending_sweep["direction"] == "long"
+                and lows[i] < pending_sweep["extreme"]
+            ):
+                pending_sweep = None
+
         # bring in newly confirmed swings (confirmed_idx == i means usable from here)
         for ci in confirmed_by_idx.get(i, []):
             if df["is_swing_high_raw"].iat[ci]:
@@ -214,26 +240,44 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
 
         # --- start watching for a wick through the recent swing high (-> potential short) ---
         if pending_watch is None and pending_sweep is None and recent_swing_high is not None:
-            level, _ = recent_swing_high
+            level, swing_idx = recent_swing_high
             if highs[i] > level:
-                pending_watch = {"direction": "short", "level": level, "extreme": highs[i], "start_idx": i}
+                pending_watch = {
+                    "direction": "short", "level": level, "extreme": highs[i],
+                    "swing_idx": swing_idx, "extreme_idx": i, "start_idx": i,
+                }
 
         if pending_watch is None and pending_sweep is None and recent_swing_low is not None:
-            level, _ = recent_swing_low
+            level, swing_idx = recent_swing_low
             if lows[i] < level:
-                pending_watch = {"direction": "long", "level": level, "extreme": lows[i], "start_idx": i}
+                pending_watch = {
+                    "direction": "long", "level": level, "extreme": lows[i],
+                    "swing_idx": swing_idx, "extreme_idx": i, "start_idx": i,
+                }
 
         # --- while watching, update the extreme and check for the rejection close ---
         if pending_watch is not None:
             if pending_watch["direction"] == "short":
-                pending_watch["extreme"] = max(pending_watch["extreme"], highs[i])
+                if highs[i] > pending_watch["extreme"]:
+                    pending_watch["extreme"] = highs[i]
+                    pending_watch["extreme_idx"] = i
                 if closes[i] < pending_watch["level"]:
-                    pending_sweep = {"direction": "short", "extreme": pending_watch["extreme"], "swept_idx": i}
+                    pending_sweep = {
+                        "direction": "short", "level": pending_watch["level"],
+                        "swing_idx": pending_watch["swing_idx"], "extreme": pending_watch["extreme"],
+                        "sweep_extreme_idx": pending_watch["extreme_idx"], "swept_idx": i,
+                    }
                     pending_watch = None
             else:
-                pending_watch["extreme"] = min(pending_watch["extreme"], lows[i])
+                if lows[i] < pending_watch["extreme"]:
+                    pending_watch["extreme"] = lows[i]
+                    pending_watch["extreme_idx"] = i
                 if closes[i] > pending_watch["level"]:
-                    pending_sweep = {"direction": "long", "extreme": pending_watch["extreme"], "swept_idx": i}
+                    pending_sweep = {
+                        "direction": "long", "level": pending_watch["level"],
+                        "swing_idx": pending_watch["swing_idx"], "extreme": pending_watch["extreme"],
+                        "sweep_extreme_idx": pending_watch["extreme_idx"], "swept_idx": i,
+                    }
                     pending_watch = None
 
         # --- if we have a confirmed sweep, watch for BOS confirmation ---
@@ -248,7 +292,10 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
                             "fill_index": i + 1, # candle whose open we actually fill at
                             "direction": "short",
                             "entry_price": opens[i + 1],
+                            "swept_level": pending_sweep["level"],
+                            "swept_swing_index": pending_sweep["swing_idx"],
                             "sweep_extreme": pending_sweep["extreme"],
+                            "sweep_extreme_index": pending_sweep["sweep_extreme_idx"],
                         })
                     pending_sweep = None
                     recent_swing_high = None  # that liquidity has been used
@@ -263,7 +310,10 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
                             "fill_index": i + 1,
                             "direction": "long",
                             "entry_price": opens[i + 1],
+                            "swept_level": pending_sweep["level"],
+                            "swept_swing_index": pending_sweep["swing_idx"],
                             "sweep_extreme": pending_sweep["extreme"],
+                            "sweep_extreme_index": pending_sweep["sweep_extreme_idx"],
                         })
                     pending_sweep = None
                     recent_swing_low = None
@@ -283,9 +333,7 @@ def simulate_trade(
     cfg: StrategyConfig,
 ) -> Optional[Trade]:
     direction = signal["direction"]
-    entry_time = pd.Timestamp(signal["time"])
-    if entry_time.tzinfo is None:
-        entry_time = entry_time.tz_localize("UTC")
+    entry_time = _as_utc_timestamp(signal["time"])
     entry_price = signal["entry_price"]
     sweep_extreme = signal["sweep_extreme"]
 
@@ -319,6 +367,11 @@ def simulate_trade(
         sweep_extreme=sweep_extreme,
         size=size,
         risk_dollars=risk_dollars,
+        bos_index=signal.get("index"),
+        fill_index=signal.get("fill_index"),
+        swept_level=signal.get("swept_level"),
+        swept_swing_index=signal.get("swept_swing_index"),
+        sweep_extreme_index=signal.get("sweep_extreme_index"),
     )
 
     # Find the first eligible 1-min bar without copying/scanning every later
@@ -356,7 +409,7 @@ def simulate_trade(
             if bar_low <= current_stop:
                 if ambiguous:
                     trade.ambiguous_intrabar_events += 1
-                trade.exit_time = pd.Timestamp(bar_time)
+                trade.exit_time = _as_utc_timestamp(bar_time)
                 trade.exit_price = current_stop
                 trade.exit_reason = "trail_stop" if trailing_active else "initial_stop"
                 break
@@ -369,7 +422,7 @@ def simulate_trade(
             # assume it did and exit at the newly raised stop.
             if ambiguous:
                 trade.ambiguous_intrabar_events += 1
-                trade.exit_time = pd.Timestamp(bar_time)
+                trade.exit_time = _as_utc_timestamp(bar_time)
                 trade.exit_price = current_stop
                 trade.exit_reason = "trail_stop"
                 break
@@ -387,7 +440,7 @@ def simulate_trade(
             if bar_high >= current_stop:
                 if ambiguous:
                     trade.ambiguous_intrabar_events += 1
-                trade.exit_time = pd.Timestamp(bar_time)
+                trade.exit_time = _as_utc_timestamp(bar_time)
                 trade.exit_price = current_stop
                 trade.exit_reason = "trail_stop" if trailing_active else "initial_stop"
                 break
@@ -397,14 +450,14 @@ def simulate_trade(
 
             if ambiguous:
                 trade.ambiguous_intrabar_events += 1
-                trade.exit_time = pd.Timestamp(bar_time)
+                trade.exit_time = _as_utc_timestamp(bar_time)
                 trade.exit_price = current_stop
                 trade.exit_reason = "trail_stop"
                 break
 
     else:
         # ran off the end of available data without being stopped out
-        trade.exit_time = pd.Timestamp(exec_times[-1])
+        trade.exit_time = _as_utc_timestamp(exec_times[-1])
         trade.exit_price = exec_closes[-1]
         trade.exit_reason = "data_end"
 
@@ -433,7 +486,8 @@ def run_backtest(signal_df: pd.DataFrame, exec_df: pd.DataFrame, cfg: StrategyCo
     open_trade_active_until = None  # simplistic: one trade at a time
 
     for sig in signals:
-        if open_trade_active_until is not None and pd.Timestamp(sig["time"]) < open_trade_active_until:
+        signal_time = _as_utc_timestamp(sig["time"])
+        if open_trade_active_until is not None and signal_time < open_trade_active_until:
             continue  # skip overlapping signals; only one position at a time
 
         atr_val = signal_df["atr"].iat[sig["index"]]

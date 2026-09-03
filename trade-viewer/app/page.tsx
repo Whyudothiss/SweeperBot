@@ -1,0 +1,58 @@
+"use client";
+
+import { FormEvent, useEffect, useRef, useState } from "react";
+
+type Candle = { index: number; time: string; open: number; high: number; low: number; close: number };
+type Trade = { number: number; entryTime: string; exitTime: string | null; direction: "long" | "short"; entryPrice: number; initialStop: number; exitPrice: number | null; exitReason: string | null; rMultiple: number | null; pnl: number | null; ambiguousEvents: number };
+type Detail = { trade: Trade; m5Candles: Candle[]; m1Candles: Candle[]; m1Truncated: boolean; m1TotalCandles: number; markers: { swing: { index: number; price: number; label: string }; sweep: { index: number; price: number; label: string }; bos: { index: number; label: string }; entry: { index: number; price: number; label: string }; stop: { price: number; label: string }; exit: { time: string | null; price: number | null; label: string } } };
+type Summary = { tradeCount: number; lookback: number; lookforward: number; rejectionWindow: number };
+type Marker = { index?: number; time?: string | null; price?: number | null; label: string; color: string };
+
+const displayTime = (value: string | null) => value ? new Intl.DateTimeFormat("en-GB", { year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", timeZone: "UTC" }).format(new Date(value)) : "—";
+const price = (value: number | null) => value === null ? "—" : value.toFixed(3);
+
+function CandleChart({ candles, markers, title }: { candles: Candle[]; title: string; markers: Marker[] }) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const element = canvas.current;
+    if (!element || !candles.length) return;
+    const context = element.getContext("2d");
+    if (!context) return;
+    const ratio = window.devicePixelRatio || 1, width = element.clientWidth, height = element.clientHeight;
+    element.width = width * ratio; element.height = height * ratio; context.scale(ratio, ratio);
+    context.fillStyle = "#111418"; context.fillRect(0, 0, width, height);
+    const pad = { top: 26, right: 68, bottom: 28, left: 12 };
+    const levels = markers.flatMap((item) => item.price == null ? [] : [item.price]);
+    const values = candles.flatMap((item) => [item.high, item.low]).concat(levels);
+    const rawLow = Math.min(...values), rawHigh = Math.max(...values), spread = Math.max(rawHigh - rawLow, .001);
+    const low = rawLow - spread * .08, high = rawHigh + spread * .08, chartWidth = width - pad.left - pad.right, chartHeight = height - pad.top - pad.bottom;
+    const y = (value: number) => pad.top + ((high - value) / (high - low)) * chartHeight;
+    const x = (position: number) => pad.left + ((position + .5) / candles.length) * chartWidth;
+    const candleWidth = Math.max(1, Math.min(10, chartWidth / candles.length * .62));
+    context.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace"; context.textBaseline = "middle";
+    for (let line = 0; line < 5; line += 1) { const value = low + ((high - low) * line) / 4, lineY = y(value); context.strokeStyle = "#252a31"; context.beginPath(); context.moveTo(pad.left, lineY); context.lineTo(width - pad.right, lineY); context.stroke(); context.fillStyle = "#98a0ac"; context.fillText(value.toFixed(2), width - pad.right + 8, lineY); }
+    candles.forEach((item, position) => { const candleX = x(position), color = item.close >= item.open ? "#4bd5a7" : "#f07986"; context.strokeStyle = color; context.fillStyle = color; context.beginPath(); context.moveTo(candleX, y(item.high)); context.lineTo(candleX, y(item.low)); context.stroke(); const bodyTop = y(Math.max(item.open, item.close)), bodyHeight = Math.max(1, Math.abs(y(item.open) - y(item.close))); context.fillRect(candleX - candleWidth / 2, bodyTop, candleWidth, bodyHeight); });
+    markers.forEach((marker, markerPosition) => { let position = marker.index === undefined ? -1 : candles.findIndex((item) => item.index === marker.index); if (marker.time) position = candles.findIndex((item) => item.time === marker.time); if (marker.price != null) { context.strokeStyle = marker.color; context.globalAlpha = .75; context.setLineDash([5, 4]); context.beginPath(); context.moveTo(pad.left, y(marker.price)); context.lineTo(width - pad.right, y(marker.price)); context.stroke(); context.setLineDash([]); context.globalAlpha = 1; } if (position >= 0) { const markerX = x(position), candle = candles[position], markerY = y(marker.price ?? candle.close); context.fillStyle = marker.color; context.beginPath(); context.arc(markerX, markerY, 4, 0, Math.PI * 2); context.fill(); context.fillText(marker.label, Math.min(markerX + 6, width - 96), pad.top + 10 + markerPosition * 13); } });
+    [0, Math.floor(candles.length / 2), candles.length - 1].forEach((position) => { const label = new Intl.DateTimeFormat("en-GB", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", timeZone: "UTC" }).format(new Date(candles[position].time)); context.fillStyle = "#98a0ac"; context.textAlign = position === 0 ? "left" : position === candles.length - 1 ? "right" : "center"; context.fillText(label, x(position), height - 11); }); context.textAlign = "left";
+  }, [candles, markers]);
+  return <section className="chart-card"><div className="chart-heading"><h2>{title}</h2><span>{candles.length} candles</span></div><canvas ref={canvas} className="chart" aria-label={title} role="img" /></section>;
+}
+
+export default function Home() {
+  const [summary, setSummary] = useState<Summary | null>(null), [trades, setTrades] = useState<Trade[]>([]), [selected, setSelected] = useState(1), [tradeInput, setTradeInput] = useState("1"), [dateInput, setDateInput] = useState(""), [detail, setDetail] = useState<Detail | null>(null), [error, setError] = useState(""), [loading, setLoading] = useState(true);
+  const loadTrades = async (date = "") => { const response = await fetch(`/api/trades?limit=30${date ? `&date=${date}` : ""}`), data = await response.json(); if (!response.ok) throw new Error(data.error || "Could not load the trade list."); setTrades(data.trades); if (data.trades.length && date) { setSelected(data.trades[0].number); setTradeInput(String(data.trades[0].number)); } };
+  useEffect(() => { Promise.all([fetch("/api/summary").then((response) => response.json()), loadTrades()]).then(([data]) => setSummary(data)).catch((reason) => setError(reason.message)).finally(() => setLoading(false)); }, []);
+  useEffect(() => { if (!selected) return; setLoading(true); fetch(`/api/trade/${selected}`).then(async (response) => { const data = await response.json(); if (!response.ok) throw new Error(data.error || "Could not load that trade."); return data; }).then((data) => { setDetail(data); setError(""); }).catch((reason) => setError(reason.message)).finally(() => setLoading(false)); }, [selected]);
+  const chooseTrade = (number: number) => { setSelected(number); setTradeInput(String(number)); };
+  const submitNumber = (event: FormEvent) => { event.preventDefault(); const next = Number(tradeInput); if (!summary || !Number.isInteger(next) || next < 1 || next > summary.tradeCount) { setError(`Choose a trade from 1 to ${summary?.tradeCount ?? "…"}.`); return; } chooseTrade(next); };
+  const submitDate = async (event: FormEvent) => { event.preventDefault(); try { setLoading(true); await loadTrades(dateInput); setError(""); } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not search that date."); } finally { setLoading(false); } };
+  const trade = detail?.trade;
+  const m5Markers: Marker[] = detail ? [{ ...detail.markers.swing, color: "#ff8f5b" }, { ...detail.markers.sweep, color: "#f7be4d" }, { ...detail.markers.bos, color: "#aeb9ff" }, { ...detail.markers.entry, color: "#38d5d0" }, { ...detail.markers.stop, color: "#f07986" }] : [];
+  const m1Markers: Marker[] = detail ? [{ ...detail.markers.entry, time: trade?.entryTime, color: "#38d5d0" }, { ...detail.markers.stop, color: "#f07986" }, { ...detail.markers.exit, color: "#c89bff" }] : [];
+  return <main><header className="hero"><div><p className="eyebrow">XAUUSD · strategy replay</p><h1>See each trade, candle by candle.</h1><p className="subhead">Inspect whether the sweep, break of structure, entry, stop, and exit match what you meant to trade.</p></div>{summary && <div className="strategy-chip">( {summary.lookback}, {summary.lookforward} ) · window {summary.rejectionWindow} · {summary.tradeCount.toLocaleString()} trades</div>}</header>
+    <section className="controls" aria-label="Choose a trade"><form onSubmit={submitNumber}><label htmlFor="trade-number">Trade number</label><div className="input-row"><input id="trade-number" inputMode="numeric" value={tradeInput} onChange={(event) => setTradeInput(event.target.value)} /><button type="submit">Open trade</button></div></form><form onSubmit={submitDate}><label htmlFor="trade-date">Or find the first trade on a date</label><div className="input-row"><input id="trade-date" type="date" value={dateInput} onChange={(event) => setDateInput(event.target.value)} /><button type="submit" className="secondary">Find date</button></div></form><div className="stepper"><button className="secondary" onClick={() => chooseTrade(Math.max(1, selected - 1))} disabled={selected <= 1}>← Previous</button><button className="secondary" onClick={() => summary && chooseTrade(Math.min(summary.tradeCount, selected + 1))} disabled={!summary || selected >= summary.tradeCount}>Next →</button></div></section>
+    {error && <p className="error" role="alert">{error}</p>}{loading && !detail && <p className="loading">Loading market data and replaying trades…</p>}
+    {detail && trade && <><section className="trade-summary" aria-label={`Trade ${trade.number} details`}><div className={`direction ${trade.direction}`}>{trade.direction === "long" ? "LONG" : "SHORT"}</div><div><span>Entry</span><strong>{price(trade.entryPrice)}</strong><small>{displayTime(trade.entryTime)}</small></div><div><span>Initial stop</span><strong>{price(trade.initialStop)}</strong></div><div><span>Exit</span><strong>{price(trade.exitPrice)}</strong><small>{trade.exitReason?.replace("_", " ")}</small></div><div><span>Result</span><strong className={trade.rMultiple && trade.rMultiple > 0 ? "positive" : "negative"}>{trade.rMultiple?.toFixed(2)}R</strong><small>${trade.pnl?.toFixed(2)}</small></div><div><span>1-min ambiguity</span><strong>{trade.ambiguousEvents}</strong><small>{trade.ambiguousEvents ? "conservative exit used" : "none"}</small></div></section><p className="legend"><i className="swing" /> Actual (2,1) swing <i className="sweep" /> Sweep wick <i className="bos" /> BOS candle <i className="entry" /> Entry <i className="stop" /> Initial stop <i className="exit" /> Exit</p><CandleChart title="M5 setup: swing → sweep → BOS → entry" candles={detail.m5Candles} markers={m5Markers} />{detail.m1Truncated && <p className="notice">This trade spans {detail.m1TotalCandles.toLocaleString()} one-minute candles. The centre is omitted so both the entry and exit remain visible.</p>}<CandleChart title="M1 execution: entry → trailing stop / exit" candles={detail.m1Candles} markers={m1Markers} /></>}
+    <section className="trade-list"><div><h2>Quick trade list</h2><span>Click any row to inspect it</span></div><div className="list-scroll">{trades.map((item) => <button key={item.number} className={item.number === selected ? "trade-row selected" : "trade-row"} onClick={() => chooseTrade(item.number)}><b>#{item.number}</b><span className={item.direction}>{item.direction}</span><span>{displayTime(item.entryTime)}</span><strong className={item.rMultiple && item.rMultiple > 0 ? "positive" : "negative"}>{item.rMultiple?.toFixed(2)}R</strong></button>)}</div></section>
+  </main>;
+}

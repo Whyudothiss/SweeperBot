@@ -28,7 +28,7 @@ const START_YEAR = 2015;
 const END_YEAR = 2025;
 
 const INSTRUMENT = "XAU_USD";
-const GRANULARITY = "M1";
+const GRANULARITY = "M5";
 const PRICE_COMPONENT = "M";
 
 const START_DATE = `${START_YEAR}-01-01T00:00:00Z`;

@@ -382,12 +382,15 @@ def simulate_trade(
 
     current_stop = initial_stop
     trailing_active = False
-    r_one_distance = stop_distance  # 1R = initial risk distance
+    r_one_distance = stop_distance
+    running_extreme = entry_price  # best price reached so far, for trailing purposes
 
     exec_highs = exec_df["high"].values
     exec_lows = exec_df["low"].values
     exec_closes = exec_df["close"].values
     exec_times = exec_df["datetime_utc"].values
+
+    EPS = 1e-9  # guards against float noise landing just under a whole-R boundary
 
     for j in range(exec_start_idx, len(exec_df)):
         bar_high = exec_highs[j]
@@ -395,14 +398,16 @@ def simulate_trade(
         bar_time = exec_times[j]
 
         if direction == "long":
-            # Existing stop first: if it was touched at any point in the bar,
-            # use that older, less favorable stop.
-            will_trail = trailing_active or (
-                (bar_high - entry_price) / r_one_distance >= cfg.trail_activation_r
-            )
-            candidate_stop = current_stop
-            if will_trail:
-                candidate_stop = max(current_stop, bar_high - r_one_distance)
+            if bar_high > running_extreme:
+                running_extreme = bar_high
+            achieved_r = (running_extreme - entry_price) / r_one_distance
+
+            if achieved_r >= cfg.trail_activation_r:
+                step_r = np.floor(achieved_r + EPS) - 1   # 1R->0 (BE), 2R->1R, 3R->2R...
+                candidate_stop = max(current_stop, entry_price + step_r * r_one_distance)
+            else:
+                candidate_stop = current_stop
+
             stop_was_raised = candidate_stop > current_stop
             ambiguous = stop_was_raised and bar_low <= candidate_stop
 
@@ -414,12 +419,9 @@ def simulate_trade(
                 trade.exit_reason = "trail_stop" if trailing_active else "initial_stop"
                 break
 
-            trailing_active = will_trail
+            trailing_active = trailing_active or (achieved_r >= cfg.trail_activation_r)
             current_stop = candidate_stop
 
-            # If the low could have occurred after the high that raised the
-            # stop, OHLC data cannot establish the order.  Conservatively
-            # assume it did and exit at the newly raised stop.
             if ambiguous:
                 trade.ambiguous_intrabar_events += 1
                 trade.exit_time = _as_utc_timestamp(bar_time)
@@ -428,12 +430,16 @@ def simulate_trade(
                 break
 
         else:  # short
-            will_trail = trailing_active or (
-                (entry_price - bar_low) / r_one_distance >= cfg.trail_activation_r
-            )
-            candidate_stop = current_stop
-            if will_trail:
-                candidate_stop = min(current_stop, bar_low + r_one_distance)
+            if bar_low < running_extreme:
+                running_extreme = bar_low
+            achieved_r = (entry_price - running_extreme) / r_one_distance
+
+            if achieved_r >= cfg.trail_activation_r:
+                step_r = np.floor(achieved_r + EPS) - 1
+                candidate_stop = min(current_stop, entry_price - step_r * r_one_distance)
+            else:
+                candidate_stop = current_stop
+
             stop_was_lowered = candidate_stop < current_stop
             ambiguous = stop_was_lowered and bar_high >= candidate_stop
 
@@ -445,7 +451,7 @@ def simulate_trade(
                 trade.exit_reason = "trail_stop" if trailing_active else "initial_stop"
                 break
 
-            trailing_active = will_trail
+            trailing_active = trailing_active or (achieved_r >= cfg.trail_activation_r)
             current_stop = candidate_stop
 
             if ambiguous:
@@ -456,7 +462,6 @@ def simulate_trade(
                 break
 
     else:
-        # ran off the end of available data without being stopped out
         trade.exit_time = _as_utc_timestamp(exec_times[-1])
         trade.exit_price = exec_closes[-1]
         trade.exit_reason = "data_end"

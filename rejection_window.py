@@ -4,9 +4,14 @@ some larger window) with lookback/lookforward held fixed, to see whether
 allowing multi-candle rejection helps or hurts XAUUSD 5-min performance.
 
 Usage:
-    python sweep_rejection_window.py
+    python rejection_window.py
+    python rejection_window.py \
+        --signal-path data/processed/oanda_xauusd_m5_master.parquet \
+        --exec-path data/processed/oanda_xauusd_m1_master.parquet \
+        --output oanda_rejection_window_sweep_results.csv
 """
 
+import argparse
 import pandas as pd
 from strategy_engine import StrategyConfig, run_backtest
 
@@ -21,14 +26,35 @@ FIXED_LOOKBACK = 2
 FIXED_LOOKFORWARD = 1
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Sweep rejection windows using M5 signal data and M1 execution data."
+    )
+    parser.add_argument("--signal-path", default=SIGNAL_PATH, help="M5 signal Parquet path")
+    parser.add_argument("--exec-path", default=EXEC_PATH, help="M1 execution Parquet path")
+    parser.add_argument(
+        "--output", default="rejection_window_sweep_results.csv", help="CSV path for sweep results"
+    )
+    parser.add_argument(
+        "--wait-bars", nargs="+", type=int, default=CANDIDATE_VALUES,
+        help="Rejection-window values to test (default: 0)",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     print("Loading data...")
-    signal_df = pd.read_parquet(SIGNAL_PATH)
-    exec_df = pd.read_parquet(EXEC_PATH)
+    signal_df = pd.read_parquet(args.signal_path)
+    exec_df = pd.read_parquet(args.exec_path)
+    print(f"  Signal data: {args.signal_path} ({len(signal_df):,} M5 bars)")
+    print(f"  Execution data: {args.exec_path} ({len(exec_df):,} M1 bars)")
 
     results = []
 
-    for wait_bars in CANDIDATE_VALUES:
+    for wait_bars in args.wait_bars:
+        if wait_bars < 0:
+            raise ValueError("--wait-bars values must be zero or positive")
         cfg = StrategyConfig(
             lookback=FIXED_LOOKBACK,
             lookforward=FIXED_LOOKFORWARD,
@@ -67,11 +93,11 @@ def main():
               f"Ambiguous 1-min events: {ambiguous_events}")
 
     results_df = pd.DataFrame(results)
-    results_df.to_csv("rejection_window_sweep_results.csv", index=False)
+    results_df.to_csv(args.output, index=False)
 
     print("\n=== Summary (sorted by total return) ===")
     print(results_df.sort_values("total_return_pct", ascending=False).to_string(index=False))
-    print("\nSaved: rejection_window_sweep_results.csv")
+    print(f"\nSaved: {args.output}")
 
 
 if __name__ == "__main__":

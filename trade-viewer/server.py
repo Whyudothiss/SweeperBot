@@ -7,6 +7,7 @@ parquet data and exposes only the selected trade and its surrounding candles.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,10 +22,20 @@ sys.path.insert(0, str(ROOT))
 from strategy_engine import StrategyConfig, run_backtest  # noqa: E402
 
 
+def data_path(env_name: str, default: str) -> Path:
+    """Resolve a data-file override relative to the project root."""
+    path = Path(os.environ.get(env_name, default))
+    return path if path.is_absolute() else ROOT / path
+
+
+SIGNAL_PATH = data_path("SWEEPER_SIGNAL_PATH", "data/processed/xauusd_m5_master.parquet")
+EXEC_PATH = data_path("SWEEPER_EXEC_PATH", "data/processed/xauusd_m1_master.parquet")
+
+
 class TradeStore:
     def __init__(self) -> None:
-        self.signal_df = pd.read_parquet(ROOT / "data/processed/xauusd_m5_master.parquet")
-        self.exec_df = pd.read_parquet(ROOT / "data/processed/xauusd_m1_master.parquet")
+        self.signal_df = pd.read_parquet(SIGNAL_PATH)
+        self.exec_df = pd.read_parquet(EXEC_PATH)
         self.config = StrategyConfig(
             lookback=2,
             lookforward=1,
@@ -46,6 +57,7 @@ class TradeStore:
             "direction": trade.direction,
             "entryPrice": round(trade.entry_price, 4),
             "initialStop": round(trade.initial_stop, 4),
+            "bosLevel": round(trade.bos_level, 4) if trade.bos_level is not None else None,
             "exitPrice": round(trade.exit_price, 4) if trade.exit_price is not None else None,
             "exitReason": trade.exit_reason,
             "rMultiple": round(trade.r_multiple, 3) if trade.r_multiple is not None else None,
@@ -79,6 +91,7 @@ class TradeStore:
             for point in (
                 trade.swept_swing_index,
                 trade.sweep_extreme_index,
+                trade.bos_swing_index,
                 trade.bos_index,
                 trade.fill_index,
             )
@@ -106,8 +119,10 @@ class TradeStore:
         else:
             m1_candles = self._candles(self.exec_df, m1_start, m1_stop)
 
-        swing_label = "(2,1) swing low" if trade.direction == "long" else "(2,1) swing high"
+        swing_label = "Swept swing low" if trade.direction == "long" else "Swept swing high"
         sweep_label = "Sweep wick low" if trade.direction == "long" else "Sweep wick high"
+        bos_source_label = "BOS level: swing high" if trade.direction == "long" else "BOS level: swing low"
+        bos_close_price = float(self.signal_df["close"].iat[trade.bos_index])
         return {
             "trade": self.trade_summary(number),
             "m5Candles": self._candles(self.signal_df, m5_start, m5_stop),
@@ -125,9 +140,18 @@ class TradeStore:
                     "price": round(trade.sweep_extreme, 4),
                     "label": sweep_label,
                 },
-                "bos": {"index": trade.bos_index, "label": "BOS close"},
+                "bosSource": {
+                    "index": trade.bos_swing_index,
+                    "price": round(trade.bos_level, 4),
+                    "label": bos_source_label,
+                },
+                "bos": {"index": trade.bos_index, "price": round(bos_close_price, 4), "label": "BOS close"},
                 "entry": {"index": trade.fill_index, "price": round(trade.entry_price, 4), "label": "Entry"},
-                "stop": {"price": round(trade.initial_stop, 4), "label": "Initial stop"},
+                "stop": {
+                    "time": self._time(trade.entry_time),
+                    "price": round(trade.initial_stop, 4),
+                    "label": "Initial stop",
+                },
                 "exit": {
                     "time": self._time(trade.exit_time),
                     "price": round(trade.exit_price, 4) if trade.exit_price is not None else None,
@@ -191,6 +215,8 @@ class Handler(BaseHTTPRequestHandler):
                         "lookback": store.config.lookback,
                         "lookforward": store.config.lookforward,
                         "rejectionWindow": store.config.max_rejection_wait_bars,
+                        "signalPath": str(SIGNAL_PATH.relative_to(ROOT)),
+                        "execPath": str(EXEC_PATH.relative_to(ROOT)),
                     }
                 )
                 return
@@ -214,4 +240,6 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
     print("Trade data API available at http://127.0.0.1:8765")
+    print(f"Signal data: {SIGNAL_PATH}")
+    print(f"Execution data: {EXEC_PATH}")
     server.serve_forever()

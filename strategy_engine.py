@@ -67,6 +67,11 @@ class Trade:
     swept_level: Optional[float] = None
     swept_swing_index: Optional[int] = None
     sweep_extreme_index: Optional[int] = None
+    # The opposite-side swing that the BOS candle closed through.  Keeping
+    # this lets a replay show *what* structure was broken, not merely the
+    # candle that happened to confirm it.
+    bos_level: Optional[float] = None
+    bos_swing_index: Optional[int] = None
     exit_time: Optional[pd.Timestamp] = None
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
@@ -283,7 +288,7 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
         # --- if we have a confirmed sweep, watch for BOS confirmation ---
         if pending_sweep is not None and i > pending_sweep["swept_idx"]:
             if pending_sweep["direction"] == "short" and recent_swing_low is not None:
-                bos_level, _ = recent_swing_low
+                bos_level, bos_swing_index = recent_swing_low
                 if closes[i] < bos_level and i + 1 < n:
                     if cfg.direction in ("both", "short"):
                         signals.append({
@@ -296,12 +301,14 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
                             "swept_swing_index": pending_sweep["swing_idx"],
                             "sweep_extreme": pending_sweep["extreme"],
                             "sweep_extreme_index": pending_sweep["sweep_extreme_idx"],
+                            "bos_level": bos_level,
+                            "bos_swing_index": bos_swing_index,
                         })
                     pending_sweep = None
                     recent_swing_high = None  # that liquidity has been used
 
             elif pending_sweep["direction"] == "long" and recent_swing_high is not None:
-                bos_level, _ = recent_swing_high
+                bos_level, bos_swing_index = recent_swing_high
                 if closes[i] > bos_level and i + 1 < n:
                     if cfg.direction in ("both", "long"):
                         signals.append({
@@ -314,6 +321,8 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
                             "swept_swing_index": pending_sweep["swing_idx"],
                             "sweep_extreme": pending_sweep["extreme"],
                             "sweep_extreme_index": pending_sweep["sweep_extreme_idx"],
+                            "bos_level": bos_level,
+                            "bos_swing_index": bos_swing_index,
                         })
                     pending_sweep = None
                     recent_swing_low = None
@@ -372,6 +381,8 @@ def simulate_trade(
         swept_level=signal.get("swept_level"),
         swept_swing_index=signal.get("swept_swing_index"),
         sweep_extreme_index=signal.get("sweep_extreme_index"),
+        bos_level=signal.get("bos_level"),
+        bos_swing_index=signal.get("bos_swing_index"),
     )
 
     # Find the first eligible 1-min bar without copying/scanning every later

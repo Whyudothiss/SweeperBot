@@ -15,3 +15,5 @@ __pycache__/
 # Generated processed market data
 data/processed/*.csv
 data/processed/*.parquet
+data/raw/oanda
+

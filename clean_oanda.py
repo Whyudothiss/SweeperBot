@@ -10,10 +10,12 @@ analysis. Suspicious rows are flagged, not repaired or interpolated.
 Usage:
     python clean_oanda.py m5
     python clean_oanda.py m1
+    python clean_oanda.py h1 --input raw_data/oanda/BTC_USD_H1_20160101_20260601.csv \
+        --output data/processed/oanda_btcusd_h1_master.csv
 """
 
+import argparse
 import os
-import sys
 
 import pandas as pd
 
@@ -26,14 +28,13 @@ OUTPUT_FILES = {
     "m1": "data/processed/oanda_xauusd_m1_master.csv",
     "m5": "data/processed/oanda_xauusd_m5_master.csv",
 }
-TIMEFRAME_SECONDS = {"m1": 60, "m5": 5 * 60}
+TIMEFRAME_SECONDS = {"m1": 60, "m5": 5 * 60, "m15": 15 * 60, "h1": 60 * 60}
 WEEKEND_GAP_THRESHOLD_HOURS = 20
 SHORT_GAP_THRESHOLD_MINUTES = 15
 REQUIRED_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
-def load_data(timeframe: str) -> pd.DataFrame:
-    input_file = INPUT_FILES[timeframe]
+def load_data(input_file: str) -> pd.DataFrame:
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"Input file not found: {input_file}")
 
@@ -105,13 +106,24 @@ def clean(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     return df
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Clean one OANDA candle CSV without fabricating missing prices.")
+    parser.add_argument("timeframe", nargs="?", default="m5", choices=sorted(TIMEFRAME_SECONDS))
+    parser.add_argument("--input", help="Raw OANDA CSV; required for non-XAU presets")
+    parser.add_argument("--output", help="Cleaned master CSV path")
+    return parser.parse_args()
+
+
 def main() -> None:
-    timeframe = sys.argv[1].lower() if len(sys.argv) > 1 else "m5"
-    if timeframe not in INPUT_FILES:
-        raise ValueError("Timeframe must be 'm1' or 'm5'.")
+    args = parse_args()
+    timeframe = args.timeframe
+    input_file = args.input or INPUT_FILES.get(timeframe)
+    output_file = args.output or OUTPUT_FILES.get(timeframe)
+    if not input_file or not output_file:
+        raise ValueError("Use --input and --output when cleaning M15/H1 or a non-XAU instrument.")
 
     print(f"Loading OANDA {timeframe} data...")
-    df = clean(load_data(timeframe), timeframe)
+    df = clean(load_data(input_file), timeframe)
 
     columns = [
         "timestamp", "datetime_utc", "datetime_jst",
@@ -120,8 +132,9 @@ def main() -> None:
         "is_flat_candle", "gap_seconds", "is_weekend_gap",
         "is_short_data_gap", "is_suspect",
     ]
-    output_file = OUTPUT_FILES[timeframe]
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    output_directory = os.path.dirname(output_file)
+    if output_directory:
+        os.makedirs(output_directory, exist_ok=True)
     df[columns].to_csv(output_file, index=False)
     print(f"Saved: {output_file} ({len(df)} rows)")
     print(f"Suspect rows: {df['is_suspect'].sum()} ({df['is_suspect'].mean() * 100:.2f}%)")

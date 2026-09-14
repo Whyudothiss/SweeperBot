@@ -37,13 +37,13 @@ expanding to other assets. Reasons:
 
 ## Target multi-asset config (future scope, after XAUUSD is validated)
 
-| Asset   | Direction     | Timeframe | Session Mode   | Exit           |
-|---------|---------------|-----------|-----------------|----------------|
-| XAUUSD  | Long + short  | M5        | No session      | Trailing stop  |
-| BTCUSD  | Long + short  | H1        | No session      | Trailing stop  |
-| SPX     | Long only     | M15       | Asset session   | Trailing stop  |
-| NDX     | Long only     | M15       | Asset session   | Trailing stop  |
-| GBPUSD  | Long + short  | M15       | Asset session   | Fixed 1R exit  |
+| Asset   | Direction     | Timeframe | Session Mode   | Exit           | Risk/trade |
+|---------|---------------|-----------|----------------|----------------|------------|
+| XAUUSD  | Long + short  | M5        | No session     | Trailing stop  | 0.5%       |
+| BTCUSD  | Long + short  | H1        | No session     | Trailing stop  | 2.0%       |
+| SPX     | Long only     | M15       | Asset session  | Trailing stop  | 1.5%       |
+| NDX     | Long only     | M15       | Asset session  | Trailing stop  | 1.5%       |
+| GBPUSD  | Long + short  | M15       | Asset session  | Fixed 1R exit  | 1.5%       |
 
 ## The swing lookback/lookforward ratio problem
 
@@ -72,12 +72,31 @@ explicitly in `strategy_engine.py`.
 
 ## Two-timeframe design: signal vs. execution
 
-Signals (swing detection, sweep, break of structure) are generated on the **signal timeframe**
-(5-min for XAUUSD). Trade management (did the stop or trailing stop actually get hit, and in
-what order relative to any favorable move) is simulated on **1-minute data**, because within a
-single 5-min candle you cannot tell from OHLC alone which level was touched first if both the
-stop and a favorable move occurred within that same candle. Stops are touch-based (execute the
-instant price reaches the level), matching how a real stop order behaves, not close-based.
+Swings and sweep rejection are generated on the **signal timeframe** (5-min for XAUUSD). After
+a sweep candle closes back inside its swept level, the opposing confirmed swing price becomes
+a stop-style BOS entry. The first **1-minute** candle to touch that price supplies the entry
+time; if it gaps through, the fill uses the M1 open. The initial benchmark stop is exactly at
+the sweep wick (zero ATR buffer). Trade management also uses M1 data. Stops are touch-based,
+and any entry-minute or trailing-stop ordering that M1 OHLC cannot resolve is handled
+conservatively.
+
+The source transcript also mentions a volatility filter that skips quiet/dead markets, but it
+does not disclose a reproducible formula or threshold. That filter is therefore not included;
+adding an invented threshold would make comparison less honest, not more accurate.
+
+## Trade viewer
+
+The viewer defaults to OANDA XAUUSD M5/M1, `(18,6)`, 0.5% risk, and an exact-wick stop. This
+ratio most closely matched the source video's gold trade count in the current parity check.
+Override any of these without editing code:
+
+```bash
+cd trade-viewer
+SWEEPER_LOOKBACK=13 SWEEPER_LOOKFORWARD=3 npm run dev
+```
+
+Optional overrides are `SWEEPER_SIGNAL_PATH`, `SWEEPER_EXEC_PATH`, `SWEEPER_RISK_PCT`, and
+`SWEEPER_STOP_BUFFER_ATR_MULT`.
 
 ## Pipeline
 
@@ -94,6 +113,40 @@ instant price reaches the level), matching how a real stop order behaves, not cl
    on XAUUSD 5-min and scores each combination.
 5. (Later) Extend to BTCUSD, SPX, NDX, GBPUSD with their respective timeframes, session
    filters, and directional restrictions per the target config table above.
+
+## OANDA five-asset data
+
+The configurable OANDA downloader covers the five assets described in the
+second video and downloads both the signal timeframe and M1 execution data.
+Instrument availability varies by OANDA account division, so list the exact
+instruments available to your account before downloading:
+
+```bash
+export OANDA_API_TOKEN="your-token"
+export OANDA_ACCOUNT_ID="your-account-id"
+export OANDA_ENV="practice"
+node fetch_oanda_portfolio.js --list-instruments
+```
+
+The built-in candidates are `XAU_USD`, `BTC_USD`, `SPX500_USD`, `NAS100_USD`,
+and `GBP_USD`. If those names are available, download the January 2016 through
+May 2026 study period. Interrupted downloads retain a `.part` file and resume
+when the same command is run again.
+
+```bash
+node fetch_oanda_portfolio.js --preset portfolio
+python3 prepare_oanda_portfolio.py --preset portfolio
+```
+
+The preparation step writes these Parquet pairs under `data/processed`:
+
+| Asset | Signal | Execution |
+|---|---|---|
+| XAUUSD | `oanda_xauusd_m5_master.parquet` | `oanda_xauusd_m1_master.parquet` |
+| BTCUSD | `oanda_btcusd_h1_master.parquet` | `oanda_btcusd_m1_master.parquet` |
+| SPX | `oanda_spx_m15_master.parquet` | `oanda_spx_m1_master.parquet` |
+| NDX | `oanda_ndx_m15_master.parquet` | `oanda_ndx_m1_master.parquet` |
+| GBPUSD | `oanda_gbpusd_m15_master.parquet` | `oanda_gbpusd_m1_master.parquet` |
 
 ## Honest framing
 

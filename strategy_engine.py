@@ -4,9 +4,12 @@ Liquidity Sweep + Break of Structure strategy engine.
 Design:
   - Signal generation (swing points, sweep, BOS) runs on the SIGNAL_TIMEFRAME
     (e.g. 5-min bars).
+  - A BOS arms a stop-style entry at the broken swing price.  The first
+    1-MIN bar that reaches that price supplies the fill time (and the open if
+    price gaps through the level).
   - Trade management (did we get stopped out / trailed out, and exactly when)
-    runs on 1-MIN bars, because within a single 5-min candle you cannot tell
-    the order in which the stop and any favorable move occurred.
+    also runs on 1-MIN bars, because within a single signal candle you cannot
+    tell the order in which the stop and any favorable move occurred.
   - Stops are TOUCH-based (like a real stop order), not close-based.
   - No look-ahead: a swing point only becomes usable `lookforward` bars after
     it forms, matching how you'd actually be able to detect it live.
@@ -44,7 +47,7 @@ class StrategyConfig:
     lookback: int = 2              # candles to the left required to confirm a swing
     lookforward: int = 1           # candles to the right required to confirm a swing
     atr_period: int = 14
-    stop_buffer_atr_mult: float = 0.15   # buffer beyond sweep wick, in units of ATR
+    stop_buffer_atr_mult: float = 0.0    # benchmark: stop exactly at sweep wick; optionally add ATR units
     trail_activation_r: float = 1.0      # start trailing once unrealized profit >= this many R
     max_pending_bars: int = 100          # invalidate a pending sweep if BOS doesn't confirm within this many signal-timeframe bars
     max_rejection_wait_bars: int = 0    # invalidate a wick-through-level watch if it never closes back inside within this many bars
@@ -67,9 +70,9 @@ class Trade:
     swept_level: Optional[float] = None
     swept_swing_index: Optional[int] = None
     sweep_extreme_index: Optional[int] = None
-    # The opposite-side swing that the BOS candle closed through.  Keeping
-    # this lets a replay show *what* structure was broken, not merely the
-    # candle that happened to confirm it.
+    sweep_confirm_index: Optional[int] = None
+    # The opposite-side swing whose price triggers the BOS entry.  Keeping
+    # this lets a replay show exactly what structure was broken.
     bos_level: Optional[float] = None
     bos_swing_index: Optional[int] = None
     exit_time: Optional[pd.Timestamp] = None
@@ -80,6 +83,7 @@ class Trade:
     # Number of 1-minute OHLC bars where the high/low ordering could change
     # the trailing-stop result.  The simulator takes the conservative exit.
     ambiguous_intrabar_events: int = 0
+    ambiguous_entry_bar: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +141,11 @@ def detect_swings(df: pd.DataFrame, lookback: int, lookforward: int) -> pd.DataF
     is_swing_low = np.zeros(n, dtype=bool)
 
     for i in range(lookback, n - lookforward):
-        if not usable[i]:
+        # A swing needs a clean, continuous comparison window.  It is not
+        # enough for only the candidate candle to be usable: otherwise a
+        # flat/suspect candle or a gap beside it can silently define the
+        # structure level.
+        if not usable[i - lookback:i + lookforward + 1].all():
             continue
         left = highs[i - lookback:i]
         right = highs[i + 1:i + 1 + lookforward]
@@ -179,22 +187,17 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
          close never comes back inside within max_rejection_wait_bars, the
          watch is cancelled (treated as a genuine breakout, not a sweep).
       3. Confirmed sweep, watching for BOS: once the close comes back inside
-         the level, we watch for a break of structure through the most
-         recent confirmed swing on the OPPOSITE side. If that doesn't
-         happen within max_pending_bars, the setup is cancelled.
+         the level, arm an entry at the most recent confirmed swing on the
+         OPPOSITE side. A later candle touching that price is a BOS trigger.
+         The 1-minute executor determines the exact first-touch time. If BOS
+         does not occur within max_pending_bars, the setup is cancelled.
 
-    Entry is filled at the OPEN of the candle immediately after the BOS
-    confirmation candle (not the BOS candle's own close), since in live
-    trading you can't transact at a price the instant it prints -- the
-    earliest realistic fill is the next candle's open.
-
-    Returns a list of signal dicts: {time, direction, entry_price, sweep_extreme}
+    Returns signal dictionaries containing the BOS trigger window and level.
     """
     n = len(df)
     highs = df["high"].values
     lows = df["low"].values
     closes = df["close"].values
-    opens = df["open"].values
     times = df["datetime_utc"].values
 
     # pools of confirmed-and-not-yet-swept swing levels, most recent first
@@ -285,22 +288,24 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
                     }
                     pending_watch = None
 
-        # --- if we have a confirmed sweep, watch for BOS confirmation ---
+        # --- if we have a confirmed sweep, watch for a BOS price touch ---
         if pending_sweep is not None and i > pending_sweep["swept_idx"]:
             if pending_sweep["direction"] == "short" and recent_swing_low is not None:
                 bos_level, bos_swing_index = recent_swing_low
-                if closes[i] < bos_level and i + 1 < n:
+                if lows[i] <= bos_level and i + 1 < n:
                     if cfg.direction in ("both", "short"):
                         signals.append({
-                            "time": times[i + 1],
-                            "index": i,          # BOS confirmation index (used to look up ATR etc.)
-                            "fill_index": i + 1, # candle whose open we actually fill at
+                            "time": times[i],
+                            "trigger_end_time": times[i + 1],
+                            "index": i,
+                            "fill_index": i,
                             "direction": "short",
-                            "entry_price": opens[i + 1],
+                            "entry_price": bos_level,
                             "swept_level": pending_sweep["level"],
                             "swept_swing_index": pending_sweep["swing_idx"],
                             "sweep_extreme": pending_sweep["extreme"],
                             "sweep_extreme_index": pending_sweep["sweep_extreme_idx"],
+                            "sweep_confirm_index": pending_sweep["swept_idx"],
                             "bos_level": bos_level,
                             "bos_swing_index": bos_swing_index,
                         })
@@ -309,18 +314,20 @@ def generate_signals(df: pd.DataFrame, cfg: StrategyConfig) -> List[dict]:
 
             elif pending_sweep["direction"] == "long" and recent_swing_high is not None:
                 bos_level, bos_swing_index = recent_swing_high
-                if closes[i] > bos_level and i + 1 < n:
+                if highs[i] >= bos_level and i + 1 < n:
                     if cfg.direction in ("both", "long"):
                         signals.append({
-                            "time": times[i + 1],
+                            "time": times[i],
+                            "trigger_end_time": times[i + 1],
                             "index": i,
-                            "fill_index": i + 1,
+                            "fill_index": i,
                             "direction": "long",
-                            "entry_price": opens[i + 1],
+                            "entry_price": bos_level,
                             "swept_level": pending_sweep["level"],
                             "swept_swing_index": pending_sweep["swing_idx"],
                             "sweep_extreme": pending_sweep["extreme"],
                             "sweep_extreme_index": pending_sweep["sweep_extreme_idx"],
+                            "sweep_confirm_index": pending_sweep["swept_idx"],
                             "bos_level": bos_level,
                             "bos_swing_index": bos_swing_index,
                         })
@@ -342,15 +349,51 @@ def simulate_trade(
     cfg: StrategyConfig,
 ) -> Optional[Trade]:
     direction = signal["direction"]
-    entry_time = _as_utc_timestamp(signal["time"])
-    entry_price = signal["entry_price"]
+    trigger_start = _as_utc_timestamp(signal["time"])
+    trigger_end = _as_utc_timestamp(signal["trigger_end_time"])
+    entry_level = signal["entry_price"]
     sweep_extreme = signal["sweep_extreme"]
 
-    buffer = cfg.stop_buffer_atr_mult * atr_at_signal
+    if cfg.stop_buffer_atr_mult == 0:
+        buffer = 0.0
+    elif not np.isfinite(atr_at_signal):
+        return None
+    else:
+        buffer = cfg.stop_buffer_atr_mult * atr_at_signal
     if direction == "long":
         initial_stop = sweep_extreme - buffer
     else:
         initial_stop = sweep_extreme + buffer
+
+    # Locate the first 1-minute bar that reaches the armed BOS level.  The
+    # signal-candle OHLC proves that a touch happened somewhere, while M1
+    # identifies when.  If the first M1 bar opens through the level, a real
+    # stop order fills at that open rather than at an untraded price.
+    trigger_start_idx = int(exec_df["datetime_utc"].searchsorted(trigger_start, side="left"))
+    trigger_end_idx = int(exec_df["datetime_utc"].searchsorted(trigger_end, side="left"))
+    if trigger_start_idx >= trigger_end_idx:
+        return None
+
+    exec_opens = exec_df["open"].values
+    exec_highs = exec_df["high"].values
+    exec_lows = exec_df["low"].values
+    exec_closes = exec_df["close"].values
+    exec_times = exec_df["datetime_utc"].values
+
+    entry_idx = None
+    entry_price = None
+    for j in range(trigger_start_idx, trigger_end_idx):
+        if direction == "long" and exec_highs[j] >= entry_level:
+            entry_idx = j
+            entry_price = max(float(entry_level), float(exec_opens[j]))
+            break
+        if direction == "short" and exec_lows[j] <= entry_level:
+            entry_idx = j
+            entry_price = min(float(entry_level), float(exec_opens[j]))
+            break
+    if entry_idx is None or entry_price is None:
+        return None
+    entry_time = _as_utc_timestamp(exec_times[entry_idx])
 
     # A stop must be on the loss side of the entry.  Using abs() here used to
     # turn a nonsensical stop on the profitable side into an instant +1R win.
@@ -381,32 +424,36 @@ def simulate_trade(
         swept_level=signal.get("swept_level"),
         swept_swing_index=signal.get("swept_swing_index"),
         sweep_extreme_index=signal.get("sweep_extreme_index"),
+        sweep_confirm_index=signal.get("sweep_confirm_index"),
         bos_level=signal.get("bos_level"),
         bos_swing_index=signal.get("bos_swing_index"),
     )
-
-    # Find the first eligible 1-min bar without copying/scanning every later
-    # bar for every trade.  The execution data is expected to be time-sorted.
-    exec_start_idx = exec_df["datetime_utc"].searchsorted(entry_time, side="left")
-    if exec_start_idx >= len(exec_df):
-        return None
 
     current_stop = initial_stop
     trailing_active = False
     r_one_distance = stop_distance
     running_extreme = entry_price  # best price reached so far, for trailing purposes
 
-    exec_highs = exec_df["high"].values
-    exec_lows = exec_df["low"].values
-    exec_closes = exec_df["close"].values
-    exec_times = exec_df["datetime_utc"].values
-
     EPS = 1e-9  # guards against float noise landing just under a whole-R boundary
 
-    for j in range(exec_start_idx, len(exec_df)):
+    for j in range(entry_idx, len(exec_df)):
         bar_high = exec_highs[j]
         bar_low = exec_lows[j]
         bar_time = exec_times[j]
+
+        # OHLC cannot reveal whether the entry or the distant stop happened
+        # first inside the entry minute.  Treat a bar containing both as an
+        # immediate loss, the conservative assumption.
+        if j == entry_idx and (
+            (direction == "long" and bar_low <= initial_stop)
+            or (direction == "short" and bar_high >= initial_stop)
+        ):
+            trade.ambiguous_entry_bar = True
+            trade.ambiguous_intrabar_events += 1
+            trade.exit_time = _as_utc_timestamp(bar_time)
+            trade.exit_price = initial_stop
+            trade.exit_reason = "initial_stop"
+            break
 
         if direction == "long":
             if bar_high > running_extreme:
@@ -490,7 +537,18 @@ def simulate_trade(
 # Full backtest loop
 # ---------------------------------------------------------------------------
 
-def run_backtest(signal_df: pd.DataFrame, exec_df: pd.DataFrame, cfg: StrategyConfig):
+def run_backtest(
+    signal_df: pd.DataFrame,
+    exec_df: pd.DataFrame,
+    cfg: StrategyConfig,
+    entry_start_time: Optional[pd.Timestamp] = None,
+):
+    """Run the strategy, optionally ignoring entries before ``entry_start_time``.
+
+    Signal state is still generated from the whole supplied signal history.
+    This is useful for an out-of-sample period: structure formed before the
+    boundary remains known, while only entries inside the scored period count.
+    """
     signal_df = signal_df.reset_index(drop=True)
     signal_df = detect_swings(signal_df, cfg.lookback, cfg.lookforward)
     signal_df["atr"] = compute_atr(signal_df, cfg.atr_period)
@@ -500,19 +558,20 @@ def run_backtest(signal_df: pd.DataFrame, exec_df: pd.DataFrame, cfg: StrategyCo
     equity = cfg.base_capital
     trades: List[Trade] = []
     open_trade_active_until = None  # simplistic: one trade at a time
+    entry_start = _as_utc_timestamp(entry_start_time) if entry_start_time is not None else None
 
     for sig in signals:
-        signal_time = _as_utc_timestamp(sig["time"])
-        if open_trade_active_until is not None and signal_time < open_trade_active_until:
-            continue  # skip overlapping signals; only one position at a time
-
         atr_val = signal_df["atr"].iat[sig["index"]]
-        if pd.isna(atr_val):
+        if cfg.stop_buffer_atr_mult != 0 and pd.isna(atr_val):
             continue
 
         trade = simulate_trade(sig, exec_df, atr_val, equity, cfg)
         if trade is None:
             continue
+        if entry_start is not None and trade.entry_time < entry_start:
+            continue
+        if open_trade_active_until is not None and trade.entry_time < open_trade_active_until:
+            continue  # only one position at a time; compare actual M1 fill times
 
         equity += trade.pnl_dollars
         trades.append(trade)

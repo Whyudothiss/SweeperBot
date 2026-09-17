@@ -16,4 +16,4 @@ __pycache__/
 data/processed/*.csv
 data/processed/*.parquet
 data/raw/oanda
-
+raw_data/oanda/

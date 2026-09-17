@@ -14,6 +14,7 @@
  * Examples:
  *   node fetch_oanda_portfolio.js --list-instruments
  *   node fetch_oanda_portfolio.js --preset btcusd
+ *   node fetch_oanda_portfolio.js --preset remaining
  *   node fetch_oanda_portfolio.js --preset portfolio
  *   node fetch_oanda_portfolio.js --instrument GBP_USD --granularity M15
  */
@@ -21,8 +22,31 @@
 const fs = require("fs");
 const path = require("path");
 
+function loadLocalEnv(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  for (const rawLine of fs.readFileSync(filePath, "utf8").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    const [, key, rawValue] = match;
+    if (process.env[key] !== undefined) continue;
+    let value = rawValue.trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    } else {
+      value = value.replace(/\s+#.*$/, "");
+    }
+    process.env[key] = value;
+  }
+}
+
+// Explicit shell variables still win; this only fills missing values from the
+// repository-local, gitignored .env file.
+loadLocalEnv(path.join(__dirname, ".env"));
+
 const TOKEN = process.env.OANDA_API_TOKEN;
-const ACCOUNT_ID = process.env.OANDA_ACCOUNT_ID;
+const CONFIGURED_ACCOUNT_ID = process.env.OANDA_ACCOUNT_ID;
 const ENVIRONMENT = process.env.OANDA_ENV || "practice";
 const API_HOST = ENVIRONMENT === "live"
   ? "https://api-fxtrade.oanda.com"
@@ -38,8 +62,8 @@ const PRESETS = {
 
 function parseArgs(argv) {
   const options = {
-    start: "2016-01-01T00:00:00Z",
-    end: "2026-06-01T00:00:00Z",
+    start: "2015-01-01T00:00:00Z",
+    end: "2026-01-01T00:00:00Z",
     price: "M",
     outputDir: path.join(__dirname, "raw_data", "oanda"),
     overwrite: false,
@@ -50,6 +74,7 @@ function parseArgs(argv) {
     const argument = argv[index];
     if (argument === "--overwrite") options.overwrite = true;
     else if (argument === "--list-instruments") options.listInstruments = true;
+    else if (argument === "--instrument-info") options.instrumentInfo = argv[++index]?.toUpperCase().split(",");
     else if (argument === "--preset") options.preset = argv[++index]?.toLowerCase();
     else if (argument === "--instrument") options.instrument = argv[++index]?.toUpperCase();
     else if (argument === "--granularity") options.granularity = argv[++index]?.toUpperCase();
@@ -66,19 +91,20 @@ function parseArgs(argv) {
 function printHelp() {
   console.log(`Usage:
   node fetch_oanda_portfolio.js --list-instruments
-  node fetch_oanda_portfolio.js --preset <xauusd|btcusd|spx|ndx|gbpusd|portfolio>
+  node fetch_oanda_portfolio.js --instrument-info SPX500_USD,NAS100_USD
+  node fetch_oanda_portfolio.js --preset <xauusd|btcusd|spx|ndx|gbpusd|remaining|portfolio>
   node fetch_oanda_portfolio.js --instrument <NAME> --granularity <M1|M5|M15|H1>
 
 Options:
-  --start <RFC3339>       Inclusive start (default 2016-01-01)
-  --end <RFC3339>         Exclusive end (default 2026-06-01)
+  --start <RFC3339>       Inclusive start (default 2015-01-01)
+  --end <RFC3339>         Exclusive end (default 2026-01-01)
   --price <M|B|A|MBA>     OANDA price component (default M)
   --output-dir <PATH>     Default raw_data/oanda
   --overwrite             Replace a completed output file
 
 Required environment:
   OANDA_API_TOKEN
-  OANDA_ACCOUNT_ID        Also required for --list-instruments
+  OANDA_ACCOUNT_ID        Optional if the token has exactly one account
   OANDA_ENV               practice (default) or live`);
 }
 
@@ -133,15 +159,43 @@ async function oandaJson(url) {
   return JSON.parse(body);
 }
 
+async function resolveAccountId() {
+  if (CONFIGURED_ACCOUNT_ID) return CONFIGURED_ACCOUNT_ID;
+  const result = await oandaJson(`${API_HOST}/v3/accounts`);
+  const accountIds = (result.accounts || []).map((account) => account.id).filter(Boolean);
+  if (accountIds.length === 1) return accountIds[0];
+  if (accountIds.length === 0) throw new Error("The token did not return any OANDA accounts.");
+  throw new Error("The token has multiple OANDA accounts. Add OANDA_ACCOUNT_ID to .env to choose one.");
+}
+
 async function listInstruments() {
-  requireValue(ACCOUNT_ID, "OANDA_ACCOUNT_ID environment variable");
-  const url = `${API_HOST}/v3/accounts/${encodeURIComponent(ACCOUNT_ID)}/instruments`;
+  const accountId = await resolveAccountId();
+  const url = `${API_HOST}/v3/accounts/${encodeURIComponent(accountId)}/instruments`;
   const result = await oandaJson(url);
   const instruments = (result.instruments || [])
     .map(({ name, displayName, type }) => ({ name, displayName, type }))
     .sort((left, right) => left.name.localeCompare(right.name));
   console.table(instruments);
   console.log(`Available instruments: ${instruments.length}`);
+}
+
+async function instrumentInfo(names) {
+  const accountId = await resolveAccountId();
+  const url = new URL(`${API_HOST}/v3/accounts/${encodeURIComponent(accountId)}/instruments`);
+  url.searchParams.set("instruments", names.join(","));
+  const result = await oandaJson(url);
+  const fields = (result.instruments || []).map((instrument) => ({
+    name: instrument.name,
+    displayName: instrument.displayName,
+    type: instrument.type,
+    marginRate: instrument.marginRate,
+    minimumTradeSize: instrument.minimumTradeSize,
+    tradeUnitsPrecision: instrument.tradeUnitsPrecision,
+    maximumOrderUnits: instrument.maximumOrderUnits,
+    pipLocation: instrument.pipLocation,
+    displayPrecision: instrument.displayPrecision,
+  }));
+  console.table(fields);
 }
 
 function tasksFor(options) {
@@ -152,7 +206,11 @@ function tasksFor(options) {
     }];
   }
   const preset = requireValue(options.preset, "--preset");
-  const names = preset === "portfolio" ? Object.keys(PRESETS) : [preset];
+  const names = preset === "portfolio"
+    ? Object.keys(PRESETS)
+    : preset === "remaining"
+      ? Object.keys(PRESETS).filter((name) => name !== "xauusd")
+      : [preset];
   return names.flatMap((name) => {
     const config = PRESETS[name];
     if (!config) throw new Error(`Unknown preset: ${name}`);
@@ -248,6 +306,10 @@ async function main() {
   requireValue(TOKEN, "OANDA_API_TOKEN environment variable");
   if (options.listInstruments) {
     await listInstruments();
+    return;
+  }
+  if (options.instrumentInfo) {
+    await instrumentInfo(options.instrumentInfo);
     return;
   }
   for (const task of tasksFor(options)) await download(task, options);

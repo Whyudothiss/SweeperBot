@@ -10,7 +10,7 @@ analysis. Suspicious rows are flagged, not repaired or interpolated.
 Usage:
     python clean_oanda.py m5
     python clean_oanda.py m1
-    python clean_oanda.py h1 --input raw_data/oanda/BTC_USD_H1_20160101_20260601.csv \
+    python clean_oanda.py h1 --input raw_data/oanda/BTC_USD_H1_20150101_20260101.csv \
         --output data/processed/oanda_btcusd_h1_master.csv
 """
 
@@ -83,15 +83,18 @@ def clean(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
 
     df["gap_seconds"] = df["datetime_utc"].diff().dt.total_seconds()
     df["is_weekend_gap"] = df["gap_seconds"] > WEEKEND_GAP_THRESHOLD_HOURS * 3600
+    gap_threshold_seconds = max(
+        SHORT_GAP_THRESHOLD_MINUTES * 60,
+        TIMEFRAME_SECONDS[timeframe],
+    )
     df["is_short_data_gap"] = (
-        (df["gap_seconds"] > SHORT_GAP_THRESHOLD_MINUTES * 60)
+        (df["gap_seconds"] > gap_threshold_seconds)
         & ~df["is_weekend_gap"]
     )
     df["is_suspect"] = (
         df["is_bad_timestamp"]
         | df["is_bad_numeric"]
         | df["is_ohlc_invalid"]
-        | df["is_flat_candle"]
     )
 
     print(f"Flagged {df['is_bad_timestamp'].sum()} bad timestamps.")

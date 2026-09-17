@@ -143,8 +143,8 @@ def detect_swings(df: pd.DataFrame, lookback: int, lookforward: int) -> pd.DataF
     for i in range(lookback, n - lookforward):
         # A swing needs a clean, continuous comparison window.  It is not
         # enough for only the candidate candle to be usable: otherwise a
-        # flat/suspect candle or a gap beside it can silently define the
-        # structure level.
+        # invalid candle or a gap beside it can silently define the structure
+        # level. Valid flat candles remain part of the observed market.
         if not usable[i - lookback:i + lookforward + 1].all():
             continue
         left = highs[i - lookback:i]

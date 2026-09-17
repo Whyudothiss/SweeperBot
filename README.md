@@ -123,19 +123,31 @@ instruments available to your account before downloading:
 
 ```bash
 export OANDA_API_TOKEN="your-token"
-export OANDA_ACCOUNT_ID="your-account-id"
 export OANDA_ENV="practice"
 node fetch_oanda_portfolio.js --list-instruments
 ```
 
+You may instead place those values in the gitignored project `.env` file;
+explicit shell environment variables take precedence. `OANDA_ACCOUNT_ID` is
+optional when the token exposes exactly one account; otherwise add it to select
+the intended account.
+
 The built-in candidates are `XAU_USD`, `BTC_USD`, `SPX500_USD`, `NAS100_USD`,
-and `GBP_USD`. If those names are available, download the January 2016 through
-May 2026 study period. Interrupted downloads retain a `.part` file and resume
+and `GBP_USD`. If those names are available, download the January 2015 through
+December 2025 study period. Interrupted downloads retain a `.part` file and resume
 when the same command is run again.
 
 ```bash
 node fetch_oanda_portfolio.js --preset portfolio
 python3 prepare_oanda_portfolio.py --preset portfolio
+```
+
+If the XAUUSD Parquets already exist, fetch and prepare only the other four assets:
+
+```bash
+node fetch_oanda_portfolio.js --preset remaining
+python3 prepare_oanda_portfolio.py --preset remaining
+python3 validate_oanda_portfolio.py
 ```
 
 The preparation step writes these Parquet pairs under `data/processed`:

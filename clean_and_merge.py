@@ -94,11 +94,12 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     print("No rows were fabricated to fill these gaps — the timestamp sequence simply skips them.")
 
     # --- overall usability flag: convenience column for backtest code ---
-    # A row is "safe to use" for swing/sweep/BOS logic if none of these fired.
+    # A flat candle can be a genuine no-movement interval, especially on
+    # sparse historical feeds. Keep the diagnostic flag but do not silently
+    # remove valid market history from swing windows.
     df["is_suspect"] = (
         df["is_bad_numeric"] |
-        df["is_ohlc_invalid"] |
-        df["is_flat_candle"]
+        df["is_ohlc_invalid"]
     )
 
     return df
